@@ -1,1 +1,379 @@
+# Part 1: Import necessary libraries and set up logging
 
+import numpy as np
+import logging
+import os
+import pickle
+import torch
+from datetime import datetime
+import gc
+from sklearn.model_selection import train_test_split
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet, BayesianRidge, ARDRegression, SGDRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor, AdaBoostRegressor, BaggingRegressor, StackingRegressor, VotingRegressor
+from sklearn.svm import SVR
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.dummy import DummyRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.decomposition import PCA
+from sklearn.kernel_ridge import KernelRidge
+from xgboost import XGBRFRegressor
+from catboost import CatBoostRegressor
+import torch
+import torch.nn as nn
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.svm import NuSVR
+from sklearn.neural_network import MLPRegressor
+from sklearn.mixture import GaussianMixture  # Import Gaussian Mixture
+
+# 현재 시간 설정
+current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+log_filename = f'log_BERT35_base_RMSE_{current_time}.log'  # 로그 파일명
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    filename=log_filename,
+    filemode='w',
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# 모델 학습 전에 기존 로그 파일 읽기
+previous_results = []
+for filename in os.listdir():
+    if filename.startswith('log_BERT35_base_RMSE_') and filename.endswith('.log'):
+        if filename != log_filename:  # 현재 생성된 로그 파일 제외
+            with open(filename, 'r') as f:
+                previous_results.extend(f.readlines())
+
+# 이전 결과를 새 로그 파일에 기록
+if previous_results:
+    with open(log_filename, 'a') as f:
+        f.write("\n=== Previous Results ===\n")
+        for line in previous_results:
+            f.write(line)
+        f.write("\n=== Current Results ===\n")
+
+# Part 2: Define helper functions for RMSE calculation, batch prediction, and batch training
+
+def calculate_multioutput_rmse(y_true, y_pred):
+    return np.mean([np.sqrt(mean_squared_error(y_true[:, i], y_pred[:, i])) for i in range(y_true.shape[1])])
+
+def batch_predict(model, X, batch_size=1000):
+    predictions = []
+    for i in range(0, len(X), batch_size):
+        batch = X[i:i + batch_size]
+        if isinstance(batch, np.ndarray):
+            batch_pred = model.predict(batch)
+        else:
+            batch_pred = model.predict(batch.toarray())  # sparse matrix 처리
+        predictions.append(batch_pred)
+    return np.vstack(predictions)
+
+def batch_train(model, X, y, batch_size):
+    for i in range(0, len(X), batch_size):
+        batch_X = X[i:i + batch_size]
+        batch_y = y[i:i + batch_size]
+
+        if isinstance(batch_X, np.ndarray):
+            batch_X_data = batch_X
+        else:
+            batch_X_data = batch_X.toarray()  # sparse matrix 처리
+
+        model.fit(batch_X_data, batch_y)  # partial_fit 제거
+        del batch_X, batch_y, batch_X_data
+        gc.collect()
+    return model
+
+# Part 3: Define data handling and logging setup functions
+
+def handle_model_data(X_train, X_test, y_train, model_name, model_batch_sizes, dense_required_models, n_components):
+    if model_name in model_batch_sizes:
+        pca = PCA(n_components=n_components)
+        X_train_dense = X_train.toarray() if hasattr(X_train, 'toarray') else X_train  # sparse matrix 처리
+        X_test_dense = X_test.toarray() if hasattr(X_test, 'toarray') else X_test  # sparse matrix 처리
+
+        X_train_pca = pca.fit_transform(X_train_dense)
+        X_test_pca = pca.transform(X_test_dense)
+
+        return X_train_pca, X_test_pca, y_train, pca
+
+    elif model_name in dense_required_models:
+        X_train_dense = X_train.toarray() if hasattr(X_train, 'toarray') else X_train  # sparse matrix 처리
+        X_test_dense = X_test.toarray() if hasattr(X_test, 'toarray') else X_test  # sparse matrix 처리
+        return X_train_dense, X_test_dense, y_train, None
+
+    return X_train, X_test, y_train, None
+
+def setup_logging(current_time):
+    log_filename = f'log_BERT35_base_RMSE_{current_time}.log'
+
+    logging.basicConfig(
+        level=logging.INFO,
+        filename=log_filename,
+        filemode='w',
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+    previous_results = []
+    for filename in os.listdir():
+        if filename.startswith('log_BERT35_base_RMSE_') and filename.endswith('.log'):
+            if filename != log_filename:
+                with open(filename, 'r') as f:
+                    previous_results.extend(f.readlines())
+
+    if previous_results:
+        with open(log_filename, 'a') as f:
+            f.write("\n=== Previous Results ===\n")
+            for line in previous_results:
+                f.write(line)
+            f.write("\n=== Current Results ===\n")
+
+    return log_filename
+
+# Part 4: Define the multi-output PyTorch model and wrapper class
+
+class MultiOutputSimpleNN(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(MultiOutputSimpleNN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, output_dim)  # Multi-output layer
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+class PyTorchRegressorWrapper(BaseEstimator, RegressorMixin):
+    def __init__(self, model, *args, **kwargs):
+        self.model = model(*args, **kwargs)
+        self.device = torch.device("cpu")         # CPU만 사용하도록 수정
+        self.model.to(self.device)
+        self.criterion = nn.MSELoss()
+        self.optimizer = torch.optim.Adam(self.model.parameters())
+
+    def fit(self, X, y, epochs=100, batch_size=32):
+        X_tensor = torch.FloatTensor(X).to(self.device)
+        y_tensor = torch.FloatTensor(y).to(self.device)
+
+        dataset = torch.utils.data.TensorDataset(X_tensor, y_tensor)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        self.model.train()
+        for epoch in range(epochs):
+            for X_batch, y_batch in dataloader:
+                self.optimizer.zero_grad()
+                y_pred = self.model(X_batch)
+                loss = self.criterion(y_pred, y_batch)
+                loss.backward()
+                self.optimizer.step()
+        return self
+
+    def predict(self, X):
+        self.model.eval()
+        with torch.no_grad():
+            X_tensor = torch.FloatTensor(X).to(self.device)
+            return self.model(X_tensor).cpu().numpy()
+
+# Part 5: Main function to load data, train models, and save the best
+
+def main():
+    current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    base_output_dir = './tests'
+    os.makedirs(base_output_dir, exist_ok=True)
+    output_dir = './tests/BERT35/RMSE'
+    os.makedirs(output_dir, exist_ok=True)
+
+    log_filename = setup_logging(current_time)
+
+    Y_data_array = Y_data_nona_biopubmed
+    X_train_nona, X_test_nona, y_train_nona, y_test_nona = train_test_split(
+        X_combined_nona_biopubmed, Y_data_array, test_size=0.2, random_state=42
+    )
+
+
+    # Model definitions
+    models = {
+        # 기본 회귀 모델
+        'LinearRegression_base': LinearRegression(),
+        'Ridge_base': MultiOutputRegressor(Ridge()),
+        'Lasso_base': MultiOutputRegressor(Lasso()),
+        'ElasticNet_base': MultiOutputRegressor(ElasticNet()),
+        'BayesianRidge_base': MultiOutputRegressor(BayesianRidge()),
+        'ARDRegression_base': MultiOutputRegressor(ARDRegression()),
+        'SGDRegressor_base': MultiOutputRegressor(SGDRegressor()),
+        'DecisionTreeRegressor_base': DecisionTreeRegressor(),
+        'RandomForestRegressor_base': RandomForestRegressor(),
+        'ExtraTreesRegressor_base': ExtraTreesRegressor(),
+        'GradientBoostingRegressor_base': MultiOutputRegressor(GradientBoostingRegressor()),
+        'HistGradientBoostingRegressor_base': MultiOutputRegressor(HistGradientBoostingRegressor()),
+        'AdaBoostRegressor_base': MultiOutputRegressor(AdaBoostRegressor()),
+        'BaggingRegressor_base': BaggingRegressor(),
+     #   'SVR_base': MultiOutputRegressor(SVR()),
+        'KNeighborsRegressor_base': KNeighborsRegressor(),
+        'GaussianProcessRegressor_base': MultiOutputRegressor(GaussianProcessRegressor()),
+        # 'PolynomialRegression_base': MultiOutputRegressor(make_pipeline(PolynomialFeatures(degree=2), LinearRegression())),
+        'DummyRegressor_base': DummyRegressor(),
+        'XGBoost_base': MultiOutputRegressor(XGBRegressor(random_state=42)),
+        'LightGBM_base': MultiOutputRegressor(LGBMRegressor(random_state=42)),
+        'CatBoost_base': MultiOutputRegressor(CatBoostRegressor(random_state=42)),
+
+        # 추가 모델들
+        'KernelRidge_rbf_base': MultiOutputRegressor(KernelRidge(kernel='rbf')),
+        'KernelRidge_poly_base': MultiOutputRegressor(KernelRidge(kernel='poly')),
+        'NuSVR_base': MultiOutputRegressor(NuSVR()),
+        'StackingRegressor_base': MultiOutputRegressor(
+            StackingRegressor(
+                estimators=[
+                    ('rf', RandomForestRegressor()),
+                    ('xgb', XGBRegressor()),
+                    ('lgbm', LGBMRegressor())
+                ],
+                final_estimator=Ridge()
+            )
+        ),
+        'VotingRegressor_base': MultiOutputRegressor(
+            VotingRegressor([
+                ('rf', RandomForestRegressor()),
+                ('xgb', XGBRegressor()),
+                ('lgbm', LGBMRegressor())
+            ])
+        ),
+        'LightGBM_dart_base': MultiOutputRegressor(LGBMRegressor(
+            boosting_type='dart',
+            random_state=42
+        )),
+        'LightGBM_goss_base': MultiOutputRegressor(LGBMRegressor(
+            boosting_type='goss',
+            random_state=42
+        )),
+
+        # 추가된 6개 모델
+        'MLPRegressor_base': MultiOutputRegressor(MLPRegressor(hidden_layer_sizes=(128, 64), max_iter=1000)),
+        'SimpleNN_base': PyTorchRegressorWrapper(MultiOutputSimpleNN, input_dim=X_train_nona.shape[1], output_dim=y_train_nona.shape[1]),  # BERT 임베딩 크기에 맞게 조정 필요
+        'GaussianMixtureRegression_base': MultiOutputRegressor(GaussianMixture()), # GaussianMixture 모델 사용
+        'GradientBoosting_Huber_base': MultiOutputRegressor(GradientBoostingRegressor(loss='huber', learning_rate=0.05)),
+        'XGBRFRegressor_base': MultiOutputRegressor(XGBRFRegressor(n_estimators=100))#,
+        # 'SuperLearner_base': MultiOutputRegressor(
+        #     SuperLearner()
+        #     .add([
+        #         ('rf', RandomForestRegressor(n_estimators=100)),
+        #         ('xgb', XGBRegressor(n_estimators=100)),
+        #         ('lgbm', LGBMRegressor(n_estimators=100))
+        #     ])
+        #     .add_meta(Ridge())
+        # )
+    }
+
+    # Configuration 설정
+    n_components = 500
+    model_batch_sizes = {
+        'BayesianRidge_base': 1000,
+        'ARDRegression_base': 1000,
+        'GaussianProcessRegressor_base': 1000,
+        'NuSVR_base': 1000
+    }
+
+    # dense matrix 필요한 모델 리스트 업데이트
+    dense_required_models = [
+        'BayesianRidge_base',
+        'ARDRegression_base',
+    #    'SVR_base',
+        'GaussianProcessRegressor_base',
+        'HistGradientBoostingRegressor_base',
+        
+    ]
+
+    # 최적 모델 변수 초기화
+    best_model = None
+    best_score = np.inf
+    best_model_name = ''
+    best_model_file = None # best model file 저장
+
+    # 기존 pkl 파일들 확인
+    existing_models = set()
+    for filename in os.listdir(output_dir):
+        if filename.endswith('.pkl'):
+            model_name = filename.split('_best_model_')[0]
+            existing_models.add(model_name)
+
+    # Model training loop
+    for model_name, model in models.items():
+        if model_name in existing_models:
+            print(f"Skipping {model_name} - already trained")
+            logging.info(f"Skipping {model_name} - already trained")
+            continue
+
+        print(f"Training {model_name}...")
+        logging.info(f"Training {model_name}...")
+
+        try:
+            # Prepare data using handle_model_data
+            X_train_proc, X_test_proc, y_train_proc, pca = handle_model_data(
+                X_train_nona, X_test_nona, y_train_nona,
+                model_name, model_batch_sizes, dense_required_models, n_components
+            )
+
+            # Train model using batch processing if specified
+            if model_name in model_batch_sizes:
+                batch_size = model_batch_sizes[model_name]
+                model = batch_train(model, X_train_proc, y_train_proc, batch_size)
+                y_pred = batch_predict(model, X_test_proc, batch_size)
+            else:
+                model.fit(X_train_proc, y_train_proc)
+                y_pred = model.predict(X_test_proc)
+
+            # Calculate RMSE
+            score = calculate_multioutput_rmse(y_test_nona, y_pred)
+            print(f"RMSE score for {model_name}: {score}")
+            logging.info(f"RMSE score for {model_name}: {score}")
+
+            # 각 모델 학습 후 바로 저장
+            model_file = os.path.join(output_dir, f"{model_name}_best_model_{current_time}.pkl")
+            save_dict = {
+                'model': model,
+                'score': score,
+                'model_name': model_name
+            }
+            if pca is not None:
+                save_dict.update({'pca': pca, 'n_components': n_components})
+                
+            print(f"Saving model to: {model_file}")
+            with open(model_file, 'wb') as file:
+                pickle.dump(save_dict, file)
+            print(f"Model successfully saved to: {model_file}")
+
+            # Update overall best model if needed
+            if score < best_score:
+                best_score = score
+                best_model_name = model_name
+                best_model_file = model_file
+
+        except Exception as e:
+            print(f"Error training {model_name}: {str(e)}")
+            logging.error(f"Error in {model_name}: {str(e)}")
+            gc.collect()
+            continue
+
+    # Print final results
+    print("\nFinal Results:")
+    print(f"Best model: {best_model_name}")
+    print(f"Best RMSE score: {best_score}")
+    print(f"Best model path: {best_model_file}")
+
+    logging.info("\nFinal Results:")
+    logging.info(f"Best model: {best_model_name}")
+    logging.info(f"Best RMSE score: {best_score}")
+    logging.info(f"Best model path: {best_model_file}")
+
+if __name__ == "__main__":
+    main()
